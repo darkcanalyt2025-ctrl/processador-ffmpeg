@@ -1,0 +1,9 @@
+{
+  "name": "processador-ffmpeg",
+  "version": "1.0.0",
+  "description": "Função para processar vídeos com FFmpeg no Azure",
+  "main": "index.js",
+  "dependencies": {
+    "@azure/storage-blob": "^12.17.0"
+  }
+}
