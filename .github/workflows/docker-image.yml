@@ -1,43 +1,26 @@
-name: Build, Push, and Deploy Docker Image to Azure
+name: Build and Push Docker Image to Docker Hub
 
 on:
   push:
     branches: [ "main" ]
 
 jobs:
-  build-push-and-deploy:
+  build-and-push:
     runs-on: ubuntu-latest
     steps:
-      # PASSO 1: Pega o seu código do repositório
       - name: Checkout repository
         uses: actions/checkout@v3
 
-      # PASSO 2: Faz login no Docker Hub (como antes)
       - name: Log in to Docker Hub
         uses: docker/login-action@v2
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      # PASSO 3: Constrói e envia a imagem para o Docker Hub (como antes)
       - name: Build and push Docker image
         uses: docker/build-push-action@v4
         with:
           context: .
           push: true
-          # !!! VERIFIQUE SE ESTA LINHA ESTÁ CORRETA COM SEU USUÁRIO DO DOCKER HUB !!!
+          # Lembre-se de verificar se seu usuário do Docker Hub está correto aqui
           tags: darkcanalyt2025/processador-ffmpeg:latest
-
-      # --- NOVO PASSO ADICIONADO ---
-      # PASSO 4: Faz o deploy da imagem para o Azure Function App
-      - name: Deploy to Azure Function App
-        uses: azure/webapps-deploy@v2
-        with:
-          # O nome do seu Function App no Azure
-          app-name: 'darkcanal-ffmpeg-processor' 
-          
-          # A senha que guardamos no cofre do GitHub
-          publish-profile: ${{ secrets.AZURE_FUNCTIONAPP_PUBLISH_PROFILE }}
-          
-          # O nome completo da imagem que queremos que o Azure use
-          images: 'darkcanalyt2025/processador-ffmpeg:latest'
