@@ -32,7 +32,7 @@ app.post('/', async (req, res) => {
     console.log(`Baixando ${blobName}...`);
     await containerClient.getBlockBlobClient(blobName).downloadToFile(inputFilePath);
 
-    const command = `ffmpeg -i ${inputFilePath} -vf scale=${resolution} ${outputFilePath}`;
+    const command = `ffmpeg -i "${inputFilePath}" -vf scale=${resolution} "${outputFilePath}"`;
     console.log(`Executando: ${command}`);
 
     await new Promise((resolve, reject) => {
