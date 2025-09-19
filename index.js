@@ -1,3 +1,4 @@
+console.log("--- index.js iniciado com sucesso ---");
 const express = require('express');
 const { exec } = require('child_process');
 const fs = require('fs').promises;
