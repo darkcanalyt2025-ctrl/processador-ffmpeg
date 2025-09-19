@@ -8,8 +8,7 @@ WORKDIR /usr/src/app
 COPY package*.json ./
 RUN npm install
 
-# --- PASSO DE VERIFICAÇÃO ADICIONADO ---
-# Lista os módulos instalados para vermos no log de build
+# Adicionado para depuração
 RUN echo "Verificando módulos instalados:" && ls -l node_modules
 
 COPY . .
