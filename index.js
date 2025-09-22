@@ -6,14 +6,11 @@ const fs = require('fs').promises;
 const path = require('path');
 const { BlobServiceClient } = require('@azure/storage-blob');
 
-// --- LINHAS QUE FALTAVAM - INÍCIO ---
 const app = express();
 app.use(express.json({ limit: '10mb' }));
 const port = process.env.PORT || 80;
 const AZURE_STORAGE_CONNECTION_STRING = process.env.AZURE_STORAGE_CONNECTION_STRING;
-// --- LINHAS QUE FALTAVAM - FIM ---
 
-// Função helper para rodar comandos
 const runCommand = (command) => {
   return new Promise((resolve, reject) => {
     console.log(`Executando: ${command}`);
@@ -27,7 +24,6 @@ const runCommand = (command) => {
   });
 };
 
-// Rota principal de processamento
 app.post('/', async (req, res) => {
   console.log('Processo de montagem de vídeo iniciado...');
   const { cenas, musica, legenda, outputFile } = req.body;
@@ -43,7 +39,7 @@ app.post('/', async (req, res) => {
   const renamedFiles = new Set();
 
   try {
-    // --- PASSO 1: BAIXAR TODOS OS ARQUIVOS ---
+    // --- PASSO 1: BAIXAR ---
     console.log('Baixando arquivos...');
     const allFilesToDownload = new Set();
     cenas.forEach(cena => {
@@ -60,8 +56,8 @@ app.post('/', async (req, res) => {
       console.log(` - Baixado: ${fileName}`);
     }
 
-    // --- PASSO 2: ANALISAR A DURAÇÃO ---
-    console.log('Analisando duração dos áudios...');
+    // --- PASSO 2: ANALISAR E RENOMEAR ---
+    console.log('Analisando duração e renomeando arquivos...');
     const sceneDurations = [];
     for (const cena of cenas) {
       const originalAudioPath = path.join(tempDir, cena.narracao);
@@ -72,61 +68,62 @@ app.post('/', async (req, res) => {
       const duration = await runCommand(`ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${newAudioPath}"`);
       sceneDurations.push(parseFloat(duration));
       console.log(` - Duração de ${cena.narracao}: ${duration}s`);
+      
+      const originalImagePath = path.join(tempDir, cena.imagem);
+      const newImagePath = `${originalImagePath}.jpg`;
+      await fs.rename(originalImagePath, newImagePath);
+      renamedFiles.add(newImagePath);
     }
 
-    // --- PASSO 3: CONSTRUIR O COMANDO FFMEG ---
+    // --- PASSO 3: CONSTRUIR O COMANDO FFMEG (VERSÃO CORRIGIDA) ---
     console.log('Construindo comando FFmpeg...');
-    let filterComplex = "";
     let inputs = "";
+    let filterComplexParts = [];
     let streamIndex = 0;
 
     for (let i = 0; i < cenas.length; i++) {
       const cena = cenas[i];
       const duration = sceneDurations[i];
-      const originalImagePath = path.join(tempDir, cena.imagem);
-      const newImagePath = `${originalImagePath}.jpg`;
-      await fs.rename(originalImagePath, newImagePath);
-      renamedFiles.add(newImagePath);
-      
+      const imagePath = path.join(tempDir, `${cena.imagem}.jpg`);
       const audioPath = path.join(tempDir, `${cena.narracao}.mp3`);
-
-      inputs += `-loop 1 -t ${duration} -i "${newImagePath}" `;
+      
+      inputs += `-loop 1 -t ${duration} -i "${imagePath}" `;
       inputs += `-i "${audioPath}" `;
 
-      filterComplex += `[${streamIndex}:v]scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1[v${i}];`;
+      filterComplexParts.push(`[${streamIndex}:v]scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1[v${i}]`);
       streamIndex++;
-      filterComplex += `[${streamIndex}:a]anull[a${i}];`;
+      filterComplexParts.push(`[${streamIndex}:a]anull[a${i}]`);
       streamIndex++;
     }
 
     const concatVideoStreams = cenas.map((_, i) => `[v${i}]`).join('');
     const concatAudioStreams = cenas.map((_, i) => `[a${i}]`).join('');
-    filterComplex += `${concatVideoStreams}concat=n=${cenas.length}:v=1:a=0[v_concat];`;
-    filterComplex += `${concatAudioStreams}concat=n=${cenas.length}:v=0:a=1[a_narracao];`;
+    filterComplexParts.push(`${concatVideoStreams}concat=n=${cenas.length}:v=1:a=0[v_concat]`);
+    filterComplexParts.push(`${concatAudioStreams}concat=n=${cenas.length}:v=0:a=1[a_narracao]`);
 
-    let finalAudio = "[a_narracao]";
+    let finalAudioMap = "[a_narracao]";
     if (musica) {
       const musicPath = path.join(tempDir, musica);
       inputs += `-i "${musicPath}" `;
-      filterComplex += `[${streamIndex}:a]volume=0.2[a_musica];`;
-      filterComplex += `[a_narracao][a_musica]amix=inputs=2:duration=longest[a_mix];`;
-      finalAudio = "[a_mix]";
+      filterComplexParts.push(`[${streamIndex}:a]volume=0.2[a_musica]`);
+      filterComplexParts.push(`[a_narracao][a_musica]amix=inputs=2:duration=longest[a_mix]`);
+      finalAudioMap = "[a_mix]";
     }
 
-    let finalVideo = "[v_concat]";
+    let finalVideoMap = "[v_concat]";
     if (legenda) {
         const legendaPath = path.join(tempDir, legenda);
-        filterComplex += `[v_concat]subtitles='${legendaPath}'[v_legendado];`;
-        finalVideo = "[v_legendado]";
+        filterComplexParts.push(`[v_concat]subtitles='${legendaPath}'[v_legendado]`);
+        finalVideoMap = "[v_legendado]";
     }
 
     const outputPath = path.join(tempDir, outputFile);
-    const command = `ffmpeg ${inputs} -filter_complex "${filterComplex}" -map "${finalVideo}" -map "${finalAudio}" -c:v libx264 -c:a aac -pix_fmt yuv420p -y "${outputPath}"`;
-    
-    // --- PASSO 4: EXECUTAR ---
+    const filterComplexString = filterComplexParts.join('; ');
+    const command = `ffmpeg ${inputs} -filter_complex "${filterComplexString}" -map "${finalVideoMap}" -map "${finalAudioMap}" -c:v libx264 -c:a aac -pix_fmt yuv420p -y "${outputPath}"`;
+
+    // ... (resto do código para executar, enviar e limpar)
     await runCommand(command);
 
-    // --- PASSO 5: ENVIAR ---
     console.log(`Enviando ${outputFile}...`);
     await containerClient.getBlockBlobClient(outputFile).uploadFile(outputPath);
     downloadedFiles.add(outputPath);
@@ -136,7 +133,6 @@ app.post('/', async (req, res) => {
   } catch (error) {
     res.status(500).send({ error: `Erro na montagem: ${error.message}` });
   } finally {
-    // --- PASSO 6: LIMPAR ---
     console.log('Limpando arquivos temporários...');
     const allTempFiles = new Set([...downloadedFiles, ...renamedFiles]);
     for (const filePath of allTempFiles) {
@@ -145,7 +141,6 @@ app.post('/', async (req, res) => {
   }
 });
 
-// --- LINHA QUE FALTAVA ---
 app.listen(port, () => {
   console.log(`Servidor de montagem de vídeo rodando na porta ${port}`);
 });
