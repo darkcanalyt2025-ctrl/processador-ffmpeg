@@ -24,6 +24,52 @@ const runCommand = (command) => {
   });
 };
 
+// Função para detectar dimensões da imagem
+const getImageDimensions = async (imagePath) => {
+  try {
+    const output = await runCommand(`ffprobe -v quiet -print_format json -show_streams "${imagePath}"`);
+    const info = JSON.parse(output);
+    const videoStream = info.streams.find(stream => stream.codec_type === 'video');
+    return {
+      width: videoStream.width,
+      height: videoStream.height,
+      aspectRatio: videoStream.width / videoStream.height
+    };
+  } catch (error) {
+    console.error('Erro ao obter dimensões da imagem:', error);
+    // Fallback para formato padrão em caso de erro
+    return { width: 1080, height: 1920, aspectRatio: 9/16 };
+  }
+};
+
+// Função para determinar formato do vídeo baseado nas dimensões
+const determineVideoFormat = (width, height) => {
+  const aspectRatio = width / height;
+  
+  if (Math.abs(aspectRatio - (9/16)) < 0.1) {
+    // Formato vertical (Stories/Shorts) - 9:16
+    console.log('Formato detectado: Vertical (Shorts) - 1080x1920');
+    return { width: 1080, height: 1920 };
+  } else if (Math.abs(aspectRatio - (16/9)) < 0.1) {
+    // Formato horizontal (YouTube padrão) - 16:9
+    console.log('Formato detectado: Horizontal (Padrão) - 1920x1080');
+    return { width: 1920, height: 1080 };
+  } else if (Math.abs(aspectRatio - 1) < 0.1) {
+    // Formato quadrado - 1:1
+    console.log('Formato detectado: Quadrado - 1080x1080');
+    return { width: 1080, height: 1080 };
+  } else {
+    // Para outros formatos, usar proporção mais próxima
+    if (aspectRatio < 1) {
+      console.log('Formato detectado: Vertical personalizado - adaptando para 1080x1920');
+      return { width: 1080, height: 1920 };
+    } else {
+      console.log('Formato detectado: Horizontal personalizado - adaptando para 1920x1080');
+      return { width: 1920, height: 1080 };
+    }
+  }
+};
+
 app.post('/', async (req, res) => {
   console.log('Processo de montagem de vídeo iniciado...');
   const { cenas, musica, legenda, outputFile } = req.body;
@@ -75,6 +121,12 @@ app.post('/', async (req, res) => {
       renamedFiles.add(newImagePath);
     }
 
+    // --- PASSO 2.5: DETECTAR RESOLUÇÃO AUTOMATICAMENTE ---
+    console.log('Detectando resolução da primeira imagem...');
+    const firstImagePath = path.join(tempDir, `${cenas[0].imagem}.jpg`);
+    const dimensions = await getImageDimensions(firstImagePath);
+    const videoFormat = determineVideoFormat(dimensions.width, dimensions.height);
+
     // --- PASSO 3: CONSTRUIR O COMANDO FFMEG ---
     console.log('Construindo comando FFmpeg...');
     let inputs = "";
@@ -90,8 +142,8 @@ app.post('/', async (req, res) => {
       inputs += `-loop 1 -t ${duration} -i "${imagePath}" `;
       inputs += `-i "${audioPath}" `;
 
-      // 🔹 Ajuste para vertical 1080x1920
-      filterComplexParts.push(`[${streamIndex}:v]scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2,setsar=1[v${i}]`);
+      // 🔹 Ajuste para resolução detectada automaticamente
+      filterComplexParts.push(`[${streamIndex}:v]scale=${videoFormat.width}:${videoFormat.height}:force_original_aspect_ratio=decrease,pad=${videoFormat.width}:${videoFormat.height}:(ow-iw)/2:(oh-ih)/2,setsar=1[v${i}]`);
       streamIndex++;
       filterComplexParts.push(`[${streamIndex}:a]anull[a${i}]`);
       streamIndex++;
