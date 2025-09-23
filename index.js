@@ -37,7 +37,6 @@ const getImageDimensions = async (imagePath) => {
     };
   } catch (error) {
     console.error('Erro ao obter dimensões da imagem:', error);
-    // Fallback para formato padrão em caso de erro
     return { width: 1080, height: 1920, aspectRatio: 9/16 };
   }
 };
@@ -45,21 +44,17 @@ const getImageDimensions = async (imagePath) => {
 // Função para determinar formato do vídeo baseado nas dimensões
 const determineVideoFormat = (width, height) => {
   const aspectRatio = width / height;
-  
+
   if (Math.abs(aspectRatio - (9/16)) < 0.1) {
-    // Formato vertical (Stories/Shorts) - 9:16
     console.log('Formato detectado: Vertical (Shorts) - 1080x1920');
     return { width: 1080, height: 1920 };
   } else if (Math.abs(aspectRatio - (16/9)) < 0.1) {
-    // Formato horizontal (YouTube padrão) - 16:9
     console.log('Formato detectado: Horizontal (Padrão) - 1920x1080');
     return { width: 1920, height: 1080 };
   } else if (Math.abs(aspectRatio - 1) < 0.1) {
-    // Formato quadrado - 1:1
     console.log('Formato detectado: Quadrado - 1080x1080');
     return { width: 1080, height: 1080 };
   } else {
-    // Para outros formatos, usar proporção mais próxima
     if (aspectRatio < 1) {
       console.log('Formato detectado: Vertical personalizado - adaptando para 1080x1920');
       return { width: 1080, height: 1920 };
@@ -69,6 +64,46 @@ const determineVideoFormat = (width, height) => {
     }
   }
 };
+
+// Função para ajustar legendas para no máximo 2 linhas
+async function sanitizeSrt(inputPath, outputPath) {
+  const content = await fs.readFile(inputPath, "utf8");
+  const blocks = content.split(/\n\n/);
+
+  const sanitizedBlocks = blocks.map(block => {
+    const lines = block.split("\n");
+    if (lines.length < 3) return block;
+
+    const [id, timecode, ...textLines] = lines;
+    let text = textLines.join(" ").replace(/\s+/g, " ").trim();
+
+    const words = text.split(" ");
+    const newLines = [];
+    let currentLine = "";
+
+    for (const word of words) {
+      if ((currentLine + " " + word).trim().length > 40) {
+        newLines.push(currentLine.trim());
+        currentLine = word;
+      } else {
+        currentLine += " " + word;
+      }
+    }
+    if (currentLine) newLines.push(currentLine.trim());
+
+    // Garante no máximo 2 linhas
+    const limitedLines = newLines.length > 2
+      ? [
+          newLines.slice(0, Math.ceil(newLines.length / 2)).join(" "),
+          newLines.slice(Math.ceil(newLines.length / 2)).join(" ")
+        ]
+      : newLines;
+
+    return [id, timecode, ...limitedLines].join("\n");
+  });
+
+  await fs.writeFile(outputPath, sanitizedBlocks.join("\n\n"), "utf8");
+}
 
 app.post('/', async (req, res) => {
   console.log('Processo de montagem de vídeo iniciado...');
@@ -110,11 +145,11 @@ app.post('/', async (req, res) => {
       const newAudioPath = `${originalAudioPath}.mp3`;
       await fs.rename(originalAudioPath, newAudioPath);
       renamedFiles.add(newAudioPath);
-      
+
       const duration = await runCommand(`ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${newAudioPath}"`);
       sceneDurations.push(parseFloat(duration));
       console.log(` - Duração de ${cena.narracao}: ${duration}s`);
-      
+
       const originalImagePath = path.join(tempDir, cena.imagem);
       const newImagePath = `${originalImagePath}.jpg`;
       await fs.rename(originalImagePath, newImagePath);
@@ -138,29 +173,28 @@ app.post('/', async (req, res) => {
       const duration = sceneDurations[i];
       const imagePath = path.join(tempDir, `${cena.imagem}.jpg`);
       const audioPath = path.join(tempDir, `${cena.narracao}.mp3`);
-      
+
       inputs += `-loop 1 -t ${duration} -i "${imagePath}" `;
       inputs += `-i "${audioPath}" `;
 
-      // 🔹 Ajuste para resolução detectada automaticamente
-      filterComplexParts.push(`[${streamIndex}:v]scale=${videoFormat.width}:${videoFormat.height}:force_original_aspect_ratio=decrease,pad=${videoFormat.width}:${videoFormat.height}:(ow-iw)/2:(oh-ih)/2,setsar=1[v${i}]`);
+      filterComplexParts.push(
+        `[${streamIndex}:v]scale=${videoFormat.width}:${videoFormat.height}:force_original_aspect_ratio=decrease,` +
+        `pad=${videoFormat.width}:${videoFormat.height}:(ow-iw)/2:(oh-ih)/2,setsar=1[v${i}]`
+      );
       streamIndex++;
       filterComplexParts.push(`[${streamIndex}:a]anull[a${i}]`);
       streamIndex++;
     }
 
-    const concatVideoStreams = cenas.map((_, i) => `[v${i}]`).join('');
-    const concatAudioStreams = cenas.map((_, i) => `[a${i}]`).join('');
-    filterComplexParts.push(`${concatVideoStreams}concat=n=${cenas.length}:v=1:a=0[v_concat]`);
-    filterComplexParts.push(`${concatAudioStreams}concat=n=${cenas.length}:v=0:a=1[a_narracao]`);
+    // Concatenação corrigida (vídeo + áudio juntos)
+    const concatParts = cenas.map((_, i) => `[v${i}][a${i}]`).join('');
+    filterComplexParts.push(`${concatParts}concat=n=${cenas.length}:v=1:a=1[v_concat][a_narracao]`);
 
     let finalAudioMap = "[a_narracao]";
     if (musica) {
       const musicPath = path.join(tempDir, musica);
-      // 🔹 Música em loop infinito
       inputs += `-stream_loop -1 -i "${musicPath}" `;
       filterComplexParts.push(`[${streamIndex}:a]volume=0.2[a_musica]`);
-      // 🔹 Música sempre termina com a narração/vídeo
       filterComplexParts.push(`[a_narracao][a_musica]amix=inputs=2:duration=first[a_mix]`);
       finalAudioMap = "[a_mix]";
       streamIndex++;
@@ -168,9 +202,16 @@ app.post('/', async (req, res) => {
 
     let finalVideoMap = "[v_concat]";
     if (legenda) {
-        const legendaPath = path.join(tempDir, legenda);
-        filterComplexParts.push(`[v_concat]subtitles='${legendaPath}'[v_legendado]`);
-        finalVideoMap = "[v_legendado]";
+      const legendaPath = path.join(tempDir, legenda);
+      const legendaSanitizedPath = path.join(tempDir, "legendas_formatadas.srt");
+
+      // Ajusta o arquivo para nunca passar de 2 linhas
+      await sanitizeSrt(legendaPath, legendaSanitizedPath);
+
+      filterComplexParts.push(
+        `[v_concat]subtitles='${legendaSanitizedPath}:force_style=Fontsize=28,MarginV=60,Alignment=2'[v_legendado]`
+      );
+      finalVideoMap = "[v_legendado]";
     }
 
     const outputPath = path.join(tempDir, outputFile);
@@ -191,7 +232,7 @@ app.post('/', async (req, res) => {
     console.log('Limpando arquivos temporários...');
     const allTempFiles = new Set([...downloadedFiles, ...renamedFiles]);
     for (const filePath of allTempFiles) {
-      await fs.unlink(filePath).catch(e => {});
+      await fs.unlink(filePath).catch(() => {});
     }
   }
 });
