@@ -193,11 +193,14 @@ app.post('/', async (req, res) => {
   try {
     // Validar extensões de arquivos
     console.log('Validando tipos de arquivos...');
+    console.log('Cenas recebidas:', cenas.map(c => ({ imagem: c.imagem, narracao: c.narracao })));
     cenas.forEach((cena, index) => {
       try {
+        console.log(`Validando cena ${index + 1} - imagem: ${cena.imagem}, narração: ${cena.narracao}`);
         validateFileExtension(cena.imagem, ALLOWED_IMAGE_EXTENSIONS);
         validateFileExtension(cena.narracao, ALLOWED_AUDIO_EXTENSIONS);
       } catch (error) {
+        console.error(`Erro validação cena ${index + 1}:`, error.message);
         throw new Error(`Cena ${index + 1}: ${error.message}`);
       }
     });
@@ -221,27 +224,34 @@ app.post('/', async (req, res) => {
     if (legenda) allFilesToDownload.add(legenda);
 
     for (const fileName of allFilesToDownload) {
+      console.log(`Tentando baixar: ${fileName}`);
       const localPath = createSafePath(tempDir, fileName);
+      console.log(`Path seguro criado: ${localPath}`);
       await containerClient.getBlockBlobClient(fileName).downloadToFile(localPath);
       downloadedFiles.add(localPath);
-      console.log(` - Baixado: ${fileName}`);
+      console.log(` - Baixado com sucesso: ${fileName}`);
     }
 
     // --- PASSO 2: ANALISAR E RENOMEAR ---
     console.log('Analisando duração e renomeando arquivos...');
     const sceneDurations = [];
     for (const cena of cenas) {
+      console.log(`Processando cena - imagem: ${cena.imagem}, narração: ${cena.narracao}`);
+      
       const originalAudioPath = createSafePath(tempDir, cena.narracao);
       const newAudioPath = `${originalAudioPath}.mp3`;
+      console.log(`Renomeando áudio: ${originalAudioPath} -> ${newAudioPath}`);
       await fs.rename(originalAudioPath, newAudioPath);
       renamedFiles.add(newAudioPath);
       
+      console.log(`Obtendo duração do áudio: ${newAudioPath}`);
       const duration = await getAudioDuration(newAudioPath);
       sceneDurations.push(duration);
       console.log(` - Duração de ${cena.narracao}: ${duration}s`);
       
       const originalImagePath = createSafePath(tempDir, cena.imagem);
       const newImagePath = `${originalImagePath}.jpg`;
+      console.log(`Renomeando imagem: ${originalImagePath} -> ${newImagePath}`);
       await fs.rename(originalImagePath, newImagePath);
       renamedFiles.add(newImagePath);
     }
@@ -325,8 +335,14 @@ app.post('/', async (req, res) => {
     });
 
   } catch (error) {
-    console.error('Erro na montagem:', error.message);
-    res.status(500).send({ error: 'Erro interno no processamento do vídeo' });
+    console.error('=== ERRO DETALHADO ===');
+    console.error('Mensagem:', error.message);
+    console.error('Stack:', error.stack);
+    console.error('=== FIM DO ERRO ===');
+    res.status(500).send({ 
+      error: 'Erro interno no processamento do vídeo',
+      details: error.message // Temporário para debug
+    });
   } finally {
     console.log('Limpando arquivos temporários...');
     const allTempFiles = new Set([...downloadedFiles, ...renamedFiles]);
