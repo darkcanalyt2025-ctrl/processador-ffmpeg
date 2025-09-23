@@ -75,7 +75,7 @@ app.post('/', async (req, res) => {
       renamedFiles.add(newImagePath);
     }
 
-    // --- PASSO 3: CONSTRUIR O COMANDO FFMEG (VERSÃO CORRIGIDA) ---
+    // --- PASSO 3: CONSTRUIR O COMANDO FFMEG ---
     console.log('Construindo comando FFmpeg...');
     let inputs = "";
     let filterComplexParts = [];
@@ -90,7 +90,8 @@ app.post('/', async (req, res) => {
       inputs += `-loop 1 -t ${duration} -i "${imagePath}" `;
       inputs += `-i "${audioPath}" `;
 
-      filterComplexParts.push(`[${streamIndex}:v]scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1[v${i}]`);
+      // 🔹 Ajuste para vertical 1080x1920
+      filterComplexParts.push(`[${streamIndex}:v]scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2,setsar=1[v${i}]`);
       streamIndex++;
       filterComplexParts.push(`[${streamIndex}:a]anull[a${i}]`);
       streamIndex++;
@@ -104,10 +105,13 @@ app.post('/', async (req, res) => {
     let finalAudioMap = "[a_narracao]";
     if (musica) {
       const musicPath = path.join(tempDir, musica);
-      inputs += `-i "${musicPath}" `;
+      // 🔹 Música em loop infinito
+      inputs += `-stream_loop -1 -i "${musicPath}" `;
       filterComplexParts.push(`[${streamIndex}:a]volume=0.2[a_musica]`);
-      filterComplexParts.push(`[a_narracao][a_musica]amix=inputs=2:duration=longest[a_mix]`);
+      // 🔹 Música sempre termina com a narração/vídeo
+      filterComplexParts.push(`[a_narracao][a_musica]amix=inputs=2:duration=first[a_mix]`);
       finalAudioMap = "[a_mix]";
+      streamIndex++;
     }
 
     let finalVideoMap = "[v_concat]";
@@ -121,7 +125,6 @@ app.post('/', async (req, res) => {
     const filterComplexString = filterComplexParts.join('; ');
     const command = `ffmpeg ${inputs} -filter_complex "${filterComplexString}" -map "${finalVideoMap}" -map "${finalAudioMap}" -c:v libx264 -c:a aac -pix_fmt yuv420p -y "${outputPath}"`;
 
-    // ... (resto do código para executar, enviar e limpar)
     await runCommand(command);
 
     console.log(`Enviando ${outputFile}...`);
