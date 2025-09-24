@@ -14,6 +14,7 @@ const AZURE_STORAGE_CONNECTION_STRING = process.env.AZURE_STORAGE_CONNECTION_STR
 
 // --- FUNÇÕES AUXILIARES ---
 const runSafeCommand = (command, args, timeoutMs = 120000) => {
+  // ... (esta função permanece a mesma)
   return new Promise((resolve, reject) => {
     console.log(`Executando: ${command} ${args.join(' ')}`);
     const child = spawn(command, args);
@@ -40,8 +41,7 @@ const runSafeCommand = (command, args, timeoutMs = 120000) => {
     });
   });
 };
-
-const getImageDimensions = async (imagePath) => {
+const getImageDimensions = async (imagePath) => { /* ...permanece o mesmo... */ 
   try {
     const output = await runSafeCommand('ffprobe', ['-v', 'quiet', '-select_streams', 'v:0', '-show_entries', 'stream=width,height', '-of', 'csv=p=0', imagePath], 15000);
     const [width, height] = output.split(',').map(Number);
@@ -53,8 +53,7 @@ const getImageDimensions = async (imagePath) => {
     return { width: 1080, height: 1920, aspectRatio: 9/16 };
   }
 };
-
-const determineVideoFormat = (width, height) => {
+const determineVideoFormat = (width, height) => { /* ...permanece o mesmo... */ 
   const aspectRatio = width / height;
   const ASPECT_RATIO_TOLERANCE = 0.1;
   if (Math.abs(aspectRatio - (9/16)) < ASPECT_RATIO_TOLERANCE) return { width: 1080, height: 1920 };
@@ -62,8 +61,7 @@ const determineVideoFormat = (width, height) => {
   if (Math.abs(aspectRatio - 1) < ASPECT_RATIO_TOLERANCE) return { width: 1080, height: 1080 };
   return aspectRatio < 1 ? { width: 1080, height: 1920 } : { width: 1920, height: 1080 };
 };
-
-async function sanitizeSrt(inputPath, outputPath) {
+async function sanitizeSrt(inputPath, outputPath) { /* ...permanece o mesmo... */ 
   const content = await fs.readFile(inputPath, "utf8");
   const blocks = content.split(/\n\n/);
   const sanitizedBlocks = blocks.map(block => {
@@ -107,7 +105,7 @@ async function processVideoInBackground(jobId, payload) {
 
   try {
     const tempFileMap = new Map();
-    // PASSO 1: BAIXAR
+    // ... PASSO 1 E 2 (DOWNLOAD E ANÁLISE) permanecem os mesmos ...
     console.log(`[${jobId}] Baixando arquivos...`);
     const filesToProcess = [];
     cenas.forEach(c => {
@@ -116,39 +114,33 @@ async function processVideoInBackground(jobId, payload) {
     });
     if (musica) filesToProcess.push({ type: 'music', originalName: musica });
     if (legenda) filesToProcess.push({ type: 'subtitle', originalName: legenda });
-
     await Promise.all(filesToProcess.map(async (fileInfo) => {
       const localPath = path.join(tempDir, `${crypto.randomUUID()}${path.extname(fileInfo.originalName)}`);
       tempFileMap.set(fileInfo.originalName, localPath);
       await containerClient.getBlockBlobClient(fileInfo.originalName).downloadToFile(localPath);
     }));
-
-    // PASSO 2: ANALISAR
     console.log(`[${jobId}] Analisando arquivos...`);
     const sceneDurations = await Promise.all(cenas.map(c => runSafeCommand('ffprobe', ['-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', tempFileMap.get(c.narracao)]).then(parseFloat)));
     const dimensions = await getImageDimensions(tempFileMap.get(cenas[0].imagem));
     const videoFormat = determineVideoFormat(dimensions.width, dimensions.height);
 
-    // PASSO 3: CRIAR CLIPES
-    console.log(`[${jobId}] Etapa 1/3: Criando clipes individuais...`);
-    const clipPaths = await Promise.all(cenas.map(async (cena, index) => {
+    // --- PASSO 3: CRIAR CLIPES (AGORA DE FORMA SEQUENCIAL E SEGURA) ---
+    console.log(`[${jobId}] Etapa 1/3: Criando clipes individuais (de forma sequencial)...`);
+    const clipPaths = [];
+    for (const [index, cena] of cenas.entries()) {
+      console.log(` - Processando clipe ${index + 1}/${cenas.length}...`);
       const clipOutputPath = path.join(tempDir, `clip_${index}.mp4`);
       const ffmpegArgs = ['-loop', '1', '-i', tempFileMap.get(cena.imagem), '-i', tempFileMap.get(cena.narracao), '-t', sceneDurations[index].toString(), '-vf', `scale=${videoFormat.width}:${videoFormat.height}:force_original_aspect_ratio=decrease,pad=${videoFormat.width}:${videoFormat.height}:(ow-iw)/2:(oh-ih)/2,setsar=1`, '-c:v', 'libx264', '-c:a', 'aac', '-pix_fmt', 'yuv420p', '-shortest', '-y', clipOutputPath];
-      
-      // --- ALTERAÇÃO APLICADA AQUI ---
       await runSafeCommand('ffmpeg', ffmpegArgs, 600000); // 10 min timeout por clipe
-      
-      return clipOutputPath;
-    }));
+      clipPaths.push(clipOutputPath);
+    }
 
-    // PASSO 4: CONCATENAR
+    // ... O restante do código (PASSO 4, 5, 6) permanece o mesmo ...
     console.log(`[${jobId}] Etapa 2/3: Concatenando clipes...`);
     const concatListPath = path.join(tempDir, 'concat_list.txt');
     await fs.writeFile(concatListPath, clipPaths.map(p => `file '${p}'`).join('\n'));
     const concatenatedVideoPath = path.join(tempDir, 'concatenated.mp4');
     await runSafeCommand('ffmpeg', ['-f', 'concat', '-safe', '0', '-i', concatListPath, '-c', 'copy', '-y', concatenatedVideoPath], 60000);
-
-    // PASSO 5: ADICIONAR EXTRAS
     console.log(`[${jobId}] Etapa 3/3: Adicionando extras...`);
     let finalVideoPath = concatenatedVideoPath;
     if (musica || legenda) {
@@ -171,14 +163,12 @@ async function processVideoInBackground(jobId, payload) {
             filterComplex.push(`${videoMap}subtitles='${escapedSrtPath}:force_style=${subtitleStyle}'[v_out]`);
             videoMap = '[v_out]';
         }
-        await runSafeCommand('ffmpeg', [...inputs, '-filter_complex', filterComplex.join(';'), '-map', videoMap, '-map', audioMap, '-c:v', 'libx264', '-c:a', 'aac', '-pix_fmt', 'yuv420p', '-y', finalOutputPath], 300000);
+        await runSafeCommand('ffmpeg', [...inputs, '-filter_complex', filterComplex.join(';'), '-map', videoMap, '-map', audioMap, '-c:v', 'libx264', '-c:a', 'aac', '-pix_fmt', 'yuv4p', '-y', finalOutputPath], 300000);
         finalVideoPath = finalOutputPath;
     } else {
         finalVideoPath = path.join(tempDir, outputFile);
         await fs.rename(concatenatedVideoPath, finalVideoPath);
     }
-
-    // PASSO 6: UPLOAD E STATUS
     console.log(`[${jobId}] Enviando vídeo final para o Azure...`);
     await containerClient.getBlockBlobClient(outputFile).uploadFile(finalVideoPath);
     const successStatus = { status: 'completed', outputFile: outputFile, completedAt: new Date().toISOString() };
@@ -194,7 +184,7 @@ async function processVideoInBackground(jobId, payload) {
   }
 }
 
-// --- ROTA PRINCIPAL ---
+// --- ROTA PRINCIPAL E SERVIDOR ---
 app.post('/', (req, res) => {
   const { outputFile } = req.body;
   if (!req.body.cenas || !outputFile) {
@@ -209,8 +199,6 @@ app.post('/', (req, res) => {
     statusFile: `${jobId}.json`
   });
 });
-
-// --- INICIA O SERVIDOR ---
 app.listen(port, () => {
   console.log(`Servidor de montagem de vídeo rodando na porta ${port}`);
 });
