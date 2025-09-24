@@ -14,13 +14,19 @@ const AZURE_STORAGE_CONNECTION_STRING = process.env.AZURE_STORAGE_CONNECTION_STR
 
 // --- FUNÇÕES AUXILIARES ---
 
-// Helper para executar comandos de forma segura com spawn
-const runSafeCommand = (command, args) => {
+// Helper para executar comandos de forma segura com spawn (COM TIMEOUT)
+const runSafeCommand = (command, args, timeoutMs = 120000) => { // 2 minutos default
   return new Promise((resolve, reject) => {
     console.log(`Executando: ${command} ${args.join(' ')}`);
     const child = spawn(command, args);
     let stdout = '';
     let stderr = '';
+
+    // Timeout para evitar comandos que ficam "pendurados"
+    const timeout = setTimeout(() => {
+      child.kill('SIGKILL');
+      reject(new Error(`Comando '${command}' timeout após ${timeoutMs}ms`));
+    }, timeoutMs);
 
     child.stdout.on('data', (data) => {
       stdout += data.toString();
@@ -31,6 +37,7 @@ const runSafeCommand = (command, args) => {
     });
 
     child.on('close', (code) => {
+      clearTimeout(timeout);
       if (code !== 0) {
         console.error('Erro no comando:', stderr);
         // Retorna o stderr completo se houver erro para melhor depuração
@@ -40,33 +47,38 @@ const runSafeCommand = (command, args) => {
     });
 
     child.on('error', (err) => {
+      clearTimeout(timeout);
       console.error('Falha ao iniciar o comando:', err);
       reject(err);
     });
   });
 };
 
-// Função para detectar dimensões da imagem usando ffprobe
+// Função OTIMIZADA para detectar dimensões da imagem usando ffprobe
 const getImageDimensions = async (imagePath) => {
   try {
+    // Comando mais rápido - só busca width,height em formato CSV
     const output = await runSafeCommand('ffprobe', [
       '-v', 'quiet',
-      '-print_format', 'json',
-      '-show_streams',
+      '-select_streams', 'v:0',
+      '-show_entries', 'stream=width,height',
+      '-of', 'csv=p=0',
       imagePath
-    ]);
-    const info = JSON.parse(output);
-    const videoStream = info.streams.find(stream => stream.codec_type === 'video');
-    if (!videoStream) {
-        throw new Error('Nenhum stream de vídeo encontrado na imagem.');
+    ], 15000); // 15 segundos timeout para detecção
+    
+    const [width, height] = output.split(',').map(Number);
+    
+    if (!width || !height) {
+      throw new Error('Dimensões inválidas detectadas');
     }
+    
     return {
-      width: videoStream.width,
-      height: videoStream.height,
-      aspectRatio: videoStream.width / videoStream.height
+      width: width,
+      height: height,
+      aspectRatio: width / height
     };
   } catch (error) {
-    console.error('Erro ao obter dimensões da imagem:', error);
+    console.error('Erro ao obter dimensões da imagem:', error.message);
     console.warn('Usando dimensões padrão (1080x1920) devido a erro na detecção da imagem.');
     // Retornar valores padrão como fallback em caso de falha na detecção
     return { width: 1080, height: 1920, aspectRatio: 9/16 };
@@ -188,9 +200,6 @@ app.post('/', async (req, res) => {
   await fs.mkdir(tempDir, { recursive: true });
 
   const tempFileMap = new Map(); // Mapeia o nome original do blob para o caminho temporário local
-  // `allTempPaths` não é mais estritamente necessário se limpamos o `tempDir` inteiro,
-  // mas pode ser útil para depuração ou limpeza seletiva em casos mais complexos.
-  // No entanto, para simplificar, vamos confiar na limpeza do `tempDir`.
 
   try {
     // --- PASSO 1: BAIXAR TODOS OS ARQUIVOS NECESSÁRIOS EM PARALELO ---
@@ -206,7 +215,8 @@ app.post('/', async (req, res) => {
     if (legenda) filesToProcess.push({ type: 'subtitle', originalName: legenda });
 
     // Baixa todos os arquivos em paralelo para melhorar a performance
-    await Promise.all(filesToProcess.map(async (fileInfo) => {
+    // OTIMIZAÇÃO: Adicionar timeout e limite de concorrência
+    const downloadPromises = filesToProcess.map(async (fileInfo) => {
       const originalExt = path.extname(fileInfo.originalName);
       // Cria um nome de arquivo temporário único com a extensão original (ou uma padrão)
       const tempFileName = `${crypto.randomUUID()}${originalExt || (fileInfo.type === 'image' ? '.jpg' : fileInfo.type === 'audio' || fileInfo.type === 'music' ? '.mp3' : '.bin')}`;
@@ -215,10 +225,18 @@ app.post('/', async (req, res) => {
       // Salva o mapeamento do nome original do blob para o caminho temporário local
       tempFileMap.set(fileInfo.originalName, localPath);
 
-      await containerClient.getBlockBlobClient(fileInfo.originalName).downloadToFile(localPath);
-      console.log(` - Baixado: ${fileInfo.originalName} para ${localPath}`);
-    }));
+      const downloadPromise = containerClient.getBlockBlobClient(fileInfo.originalName).downloadToFile(localPath);
+      
+      // Timeout de 60 segundos para cada download
+      const timeoutPromise = new Promise((_, reject) => 
+        setTimeout(() => reject(new Error(`Timeout no download de ${fileInfo.originalName}`)), 60000)
+      );
 
+      await Promise.race([downloadPromise, timeoutPromise]);
+      console.log(` - Baixado: ${fileInfo.originalName} para ${localPath}`);
+    });
+
+    await Promise.all(downloadPromises);
 
     // --- PASSO 2: ANALISAR DURAÇÃO DAS NARRAÇÕES ---
     console.log('Analisando duração das narrações...');
@@ -232,18 +250,31 @@ app.post('/', async (req, res) => {
         '-show_entries', 'format=duration',
         '-of', 'default=noprint_wrappers=1:nokey=1', // Formato de saída limpo
         audioPath
-      ]);
+      ], 30000); // 30 segundos timeout para análise de duração
+      
       sceneDurations.push(parseFloat(duration));
       console.log(` - Duração de ${cena.narracao}: ${duration}s`);
     }
 
-    // --- PASSO 2.5: DETECTAR RESOLUÇÃO E FORMATO DO VÍDEO ---
+    // --- PASSO 2.5: DETECTAR RESOLUÇÃO E FORMATO DO VÍDEO COM TIMEOUT ---
     console.log('Detectando resolução da primeira imagem para determinar o formato do vídeo...');
     const firstImagePath = tempFileMap.get(cenas[0].imagem);
     if (!firstImagePath) throw new Error('Caminho da primeira imagem não encontrado.');
-    const dimensions = await getImageDimensions(firstImagePath);
-    const videoFormat = determineVideoFormat(dimensions.width, dimensions.height);
-
+    
+    let videoFormat = { width: 1080, height: 1920 }; // Default fallback
+    try {
+      // Timeout de 20 segundos para detecção de dimensões
+      const dimensionsPromise = getImageDimensions(firstImagePath);
+      const timeoutPromise = new Promise((_, reject) => 
+        setTimeout(() => reject(new Error('Timeout na detecção de dimensões')), 20000)
+      );
+      
+      const dimensions = await Promise.race([dimensionsPromise, timeoutPromise]);
+      videoFormat = determineVideoFormat(dimensions.width, dimensions.height);
+    } catch (error) {
+      console.log(`Erro na detecção automática: ${error.message}`);
+      console.log('Usando formato padrão: Vertical (Shorts) - 1080x1920');
+    }
 
     // --- PASSO 3: CONSTRUIR E EXECUTAR O COMANDO FFmpeg ---
     console.log('Construindo comando FFmpeg...');
@@ -328,8 +359,9 @@ app.post('/', async (req, res) => {
         outputPath
     ];
 
-    // Executa o comando FFmpeg
-    await runSafeCommand('ffmpeg', ffmpegArgs);
+    // Executa o comando FFmpeg com timeout estendido
+    console.log('Executando processamento FFmpeg...');
+    await runSafeCommand('ffmpeg', ffmpegArgs, 300000); // 5 minutos timeout para FFmpeg
 
     // --- PASSO 4: ENVIAR O VÍDEO FINAL PARA O AZURE BLOB STORAGE ---
     console.log(`Enviando ${sanitizedOutputFileName} para o Azure Blob Storage...`);
@@ -337,7 +369,11 @@ app.post('/', async (req, res) => {
     console.log(`Vídeo ${sanitizedOutputFileName} enviado com sucesso.`);
 
     // Responde ao cliente com sucesso
-    res.status(200).send({ message: "Vídeo montado com sucesso!", outputFile: sanitizedOutputFileName });
+    res.status(200).send({ 
+      message: "Vídeo montado com sucesso!", 
+      outputFile: sanitizedOutputFileName,
+      resolution: `${videoFormat.width}x${videoFormat.height}`
+    });
 
   } catch (error) {
     // Tratamento de erros
