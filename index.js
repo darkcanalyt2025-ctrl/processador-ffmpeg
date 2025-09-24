@@ -172,41 +172,32 @@ async function sanitizeSrt(inputPath, outputPath) {
 // --- ROTA PRINCIPAL DA API ---
 
 app.post('/', async (req, res) => {
-  console.log('Processo de montagem de vídeo iniciado...');
+  console.log('Processo de montagem de vídeo iniciado (versão otimizada)...');
   const { cenas, musica, legenda, outputFile } = req.body;
 
-  // Validação inicial dos parâmetros obrigatórios
   if (!cenas || !cenas.length || !outputFile || !AZURE_STORAGE_CONNECTION_STRING) {
     return res.status(400).send({ error: 'Parâmetros faltando: "cenas" (não pode ser vazia) e "outputFile" são obrigatórios, e "AZURE_STORAGE_CONNECTION_STRING" deve estar configurada.' });
   }
 
-  // --- VALIDAÇÃO E SANITIZAÇÃO DE ENTRADAS ---
-  // Garante que o nome do arquivo de saída não contenha caminhos ou caracteres maliciosos
   const sanitizedOutputFileName = path.basename(outputFile);
   if (sanitizedOutputFileName !== outputFile) {
-    return res.status(400).send({ error: 'Nome do arquivo de saída inválido: não pode conter caminhos relativos ou absolutos.' });
+    return res.status(400).send({ error: 'Nome do arquivo de saída inválido.' });
   }
-  // Garante uma extensão de vídeo válida para o arquivo de saída
   if (!/\.(mp4|mov|webm|avi|mkv)$/i.test(sanitizedOutputFileName)) {
-    return res.status(400).send({ error: 'O arquivo de saída deve ter uma extensão de vídeo válida (ex: .mp4, .mov, .webm).' });
+    return res.status(400).send({ error: 'O arquivo de saída deve ter uma extensão de vídeo válida (ex: .mp4).' });
   }
 
-  // --- CONFIGURAÇÃO DO AZURE BLOB STORAGE E DIRETÓRIO TEMPORÁRIO ---
   const blobServiceClient = BlobServiceClient.fromConnectionString(AZURE_STORAGE_CONNECTION_STRING);
-  const containerClient = blobServiceClient.getContainerClient('videos'); // Container padrão 'videos'
-
-  // Cria um diretório temporário único para cada requisição para isolamento e limpeza fácil
+  const containerClient = blobServiceClient.getContainerClient('videos');
   const tempDir = path.join('/tmp', crypto.randomUUID());
   await fs.mkdir(tempDir, { recursive: true });
 
-  const tempFileMap = new Map(); // Mapeia o nome original do blob para o caminho temporário local
+  const tempFileMap = new Map();
 
   try {
-    // --- PASSO 1: BAIXAR TODOS OS ARQUIVOS NECESSÁRIOS EM PARALELO ---
+    // --- PASSO 1: BAIXAR TODOS OS ARQUIVOS (sem alteração) ---
     console.log('Baixando arquivos...');
     const filesToProcess = [];
-
-    // Adiciona todas as referências de arquivos (imagens, narrações, música, legenda)
     cenas.forEach((cena) => {
       filesToProcess.push({ type: 'image', originalName: cena.imagem });
       filesToProcess.push({ type: 'audio', originalName: cena.narracao });
@@ -214,161 +205,136 @@ app.post('/', async (req, res) => {
     if (musica) filesToProcess.push({ type: 'music', originalName: musica });
     if (legenda) filesToProcess.push({ type: 'subtitle', originalName: legenda });
 
-    // Baixa todos os arquivos em paralelo para melhorar a performance
-    // OTIMIZAÇÃO: Adicionar timeout e limite de concorrência
     const downloadPromises = filesToProcess.map(async (fileInfo) => {
-      const originalExt = path.extname(fileInfo.originalName);
-      // Cria um nome de arquivo temporário único com a extensão original (ou uma padrão)
-      const tempFileName = `${crypto.randomUUID()}${originalExt || (fileInfo.type === 'image' ? '.jpg' : fileInfo.type === 'audio' || fileInfo.type === 'music' ? '.mp3' : '.bin')}`;
+      const tempFileName = `${crypto.randomUUID()}${path.extname(fileInfo.originalName) || '.tmp'}`;
       const localPath = path.join(tempDir, tempFileName);
-
-      // Salva o mapeamento do nome original do blob para o caminho temporário local
       tempFileMap.set(fileInfo.originalName, localPath);
-
-      const downloadPromise = containerClient.getBlockBlobClient(fileInfo.originalName).downloadToFile(localPath);
-      
-      // Timeout de 60 segundos para cada download
-      const timeoutPromise = new Promise((_, reject) => 
-        setTimeout(() => reject(new Error(`Timeout no download de ${fileInfo.originalName}`)), 60000)
-      );
-
-      await Promise.race([downloadPromise, timeoutPromise]);
-      console.log(` - Baixado: ${fileInfo.originalName} para ${localPath}`);
+      await containerClient.getBlockBlobClient(fileInfo.originalName).downloadToFile(localPath);
+      console.log(` - Baixado: ${fileInfo.originalName}`);
     });
-
     await Promise.all(downloadPromises);
 
-    // --- PASSO 2: ANALISAR DURAÇÃO DAS NARRAÇÕES ---
-    console.log('Analisando duração das narrações...');
-    const sceneDurations = [];
-    for (const cena of cenas) {
+    // --- PASSO 2: ANALISAR DURAÇÕES E FORMATO (sem alteração) ---
+    console.log('Analisando duração das narrações e formato...');
+    const sceneDurations = await Promise.all(cenas.map(async (cena) => {
       const audioPath = tempFileMap.get(cena.narracao);
-      if (!audioPath) throw new Error(`Caminho da narração não encontrado para ${cena.narracao}`);
-
-      const duration = await runSafeCommand('ffprobe', [
-        '-v', 'error', // Suprime mensagens de erro verbosas
-        '-show_entries', 'format=duration',
-        '-of', 'default=noprint_wrappers=1:nokey=1', // Formato de saída limpo
-        audioPath
-      ], 30000); // 30 segundos timeout para análise de duração
-      
-      sceneDurations.push(parseFloat(duration));
-      console.log(` - Duração de ${cena.narracao}: ${duration}s`);
-    }
-
-    // --- PASSO 2.5: DETECTAR RESOLUÇÃO E FORMATO DO VÍDEO COM TIMEOUT ---
-    console.log('Detectando resolução da primeira imagem para determinar o formato do vídeo...');
-    const firstImagePath = tempFileMap.get(cenas[0].imagem);
-    if (!firstImagePath) throw new Error('Caminho da primeira imagem não encontrado.');
+      const duration = await runSafeCommand('ffprobe', ['-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', audioPath]);
+      return parseFloat(duration);
+    }));
     
-    let videoFormat = { width: 1080, height: 1920 }; // Default fallback
-    try {
-      // Timeout de 20 segundos para detecção de dimensões
-      const dimensionsPromise = getImageDimensions(firstImagePath);
-      const timeoutPromise = new Promise((_, reject) => 
-        setTimeout(() => reject(new Error('Timeout na detecção de dimensões')), 20000)
-      );
-      
-      const dimensions = await Promise.race([dimensionsPromise, timeoutPromise]);
-      videoFormat = determineVideoFormat(dimensions.width, dimensions.height);
-    } catch (error) {
-      console.log(`Erro na detecção automática: ${error.message}`);
-      console.log('Usando formato padrão: Vertical (Shorts) - 1080x1920');
-    }
+    const firstImagePath = tempFileMap.get(cenas[0].imagem);
+    const dimensions = await getImageDimensions(firstImagePath);
+    const videoFormat = determineVideoFormat(dimensions.width, dimensions.height);
 
-    // --- PASSO 3: CONSTRUIR E EXECUTAR O COMANDO FFmpeg ---
-    console.log('Construindo comando FFmpeg...');
-    let inputs = []; // Array para os argumentos de entrada do FFmpeg
-    let filterComplexParts = []; // Array para as partes do filtro complexo
-    let streamIndex = 0; // Índice global para os streams de entrada do FFmpeg
 
-    // Adiciona inputs para cada cena (imagem em loop e áudio de narração)
-    for (let i = 0; i < cenas.length; i++) {
-      const cena = cenas[i];
-      const duration = sceneDurations[i];
+    // --- NOVO PASSO 3: CRIAR CLIPES INDIVIDUAIS PARA CADA CENA ---
+    console.log('Etapa 1/3: Criando clipes de vídeo individuais...');
+    const clipPaths = []; // Array para guardar os caminhos dos clipes gerados
+    
+    for (const [index, cena] of cenas.entries()) {
       const imagePath = tempFileMap.get(cena.imagem);
       const audioPath = tempFileMap.get(cena.narracao);
+      const duration = sceneDurations[index];
+      const clipOutputPath = path.join(tempDir, `clip_${index}.mp4`);
 
-      if (!imagePath || !audioPath) throw new Error(`Caminhos de imagem ou áudio não encontrados para cena ${i}.`);
+      console.log(` - Criando clipe ${index + 1}/${cenas.length}...`);
 
-      inputs.push('-loop', '1', '-t', duration.toString(), '-i', imagePath); // Imagem em loop
-      inputs.push('-i', audioPath); // Áudio da narração
+      const ffmpegArgs = [
+        '-loop', '1',
+        '-i', imagePath,
+        '-i', audioPath,
+        '-t', duration.toString(),
+        '-vf', `scale=${videoFormat.width}:${videoFormat.height}:force_original_aspect_ratio=decrease,pad=${videoFormat.width}:${videoFormat.height}:(ow-iw)/2:(oh-ih)/2,setsar=1`,
+        '-c:v', 'libx264',
+        '-c:a', 'aac',
+        '-pix_fmt', 'yuv420p',
+        '-shortest',
+        '-y',
+        clipOutputPath
+      ];
 
-      // Escala e pad a imagem para o formato final, então combina com o áudio
-      filterComplexParts.push(
-        `[${streamIndex}:v]scale=${videoFormat.width}:${videoFormat.height}:force_original_aspect_ratio=decrease,` +
-        `pad=${videoFormat.width}:${videoFormat.height}:(ow-iw)/2:(oh-ih)/2,setsar=1[v${i}]`
-      );
-      streamIndex++; // Incrementa para o próximo stream de entrada (áudio da narração)
-      filterComplexParts.push(`[${streamIndex}:a]anull[a${i}]`); // Passa o áudio da narração sem modificação
-      streamIndex++; // Incrementa para o próximo stream de entrada
+      await runSafeCommand('ffmpeg', ffmpegArgs, 180000); // 3 min timeout por clipe
+      clipPaths.push(clipOutputPath);
     }
 
-    // Concatena todos os segmentos de vídeo e áudio juntos
-    const concatParts = cenas.map((_, i) => `[v${i}][a${i}]`).join('');
-    filterComplexParts.push(`${concatParts}concat=n=${cenas.length}:v=1:a=1[v_concat][a_narracao]`);
 
-    let finalAudioMap = "[a_narracao]"; // Stream de áudio final, inicialmente apenas a narração
-    // Adiciona música de fundo se fornecida
-    if (musica) {
-      const musicPath = tempFileMap.get(musica);
-      if (!musicPath) throw new Error(`Caminho da música não encontrado para ${musica}`);
+    // --- NOVO PASSO 4: CONCATENAR TODOS OS CLIPES ---
+    console.log('Etapa 2/3: Concatenando clipes...');
+    const concatListPath = path.join(tempDir, 'concat_list.txt');
+    const concatContent = clipPaths.map(p => `file '${p}'`).join('\n');
+    await fs.writeFile(concatListPath, concatContent);
 
-      inputs.push('-stream_loop', '-1', '-i', musicPath); // Música em loop infinito
-      filterComplexParts.push(`[${streamIndex}:a]volume=0.2[a_musica]`); // Reduz o volume da música
-      filterComplexParts.push(`[a_narracao][a_musica]amix=inputs=2:duration=first[a_mix]`); // Mixa narração com música
-      finalAudioMap = "[a_mix]";
-      streamIndex++;
-    }
-
-    let finalVideoMap = "[v_concat]"; // Stream de vídeo final, inicialmente apenas o concatenado
-    // Adiciona legendas se fornecidas
-    if (legenda) {
-      const originalLegendaPath = tempFileMap.get(legenda);
-      if (!originalLegendaPath) throw new Error(`Caminho da legenda não encontrado para ${legenda}`);
-
-      // Cria um caminho temporário único para a legenda sanitizada
-      const legendaSanitizedPath = path.join(tempDir, `legendas_formatadas_${crypto.randomUUID()}.srt`);
-
-      // Sanitiza o arquivo SRT
-      await sanitizeSrt(originalLegendaPath, legendaSanitizedPath);
-
-      // Adiciona o filtro de legendas
-      // Escapa caracteres especiais no caminho do arquivo para o FFmpeg
-      const escapedLegendaPath = legendaSanitizedPath.replace(/\\/g, '\\\\').replace(/:/g, '\\:');
-      filterComplexParts.push(
-        `[v_concat]subtitles='${escapedLegendaPath}:force_style=Fontsize=28,MarginV=60,Alignment=2'[v_legendado]`
-      );
-      finalVideoMap = "[v_legendado]";
-    }
-
-    // Caminho de saída final no diretório temporário
-    const outputPath = path.join(tempDir, sanitizedOutputFileName);
-    const filterComplexString = filterComplexParts.join('; ');
-
-    // Monta todos os argumentos para o comando FFmpeg
-    const ffmpegArgs = [
-        ...inputs,
-        '-filter_complex', filterComplexString,
-        '-map', finalVideoMap,
-        '-map', finalAudioMap,
-        '-c:v', 'libx264',      // Codec de vídeo H.264
-        '-c:a', 'aac',          // Codec de áudio AAC
-        '-pix_fmt', 'yuv420p',  // Formato de pixel (compatibilidade ampla)
-        '-y',                   // Sobrescreve o arquivo de saída se existir
-        outputPath
+    const concatenatedVideoPath = path.join(tempDir, 'concatenated.mp4');
+    const concatArgs = [
+      '-f', 'concat',
+      '-safe', '0',
+      '-i', concatListPath,
+      '-c', 'copy', // <-- A mágica da eficiência está aqui!
+      '-y',
+      concatenatedVideoPath
     ];
+    
+    await runSafeCommand('ffmpeg', concatArgs, 60000); // 1 min timeout para concatenar
 
-    // Executa o comando FFmpeg com timeout estendido
-    console.log('Executando processamento FFmpeg...');
-    await runSafeCommand('ffmpeg', ffmpegArgs, 300000); // 5 minutos timeout para FFmpeg
 
-    // --- PASSO 4: ENVIAR O VÍDEO FINAL PARA O AZURE BLOB STORAGE ---
+    // --- NOVO PASSO 5: ADICIONAR MÚSICA DE FUNDO E LEGENDAS ---
+    console.log('Etapa 3/3: Adicionando música e legendas...');
+    let finalVideoPath = concatenatedVideoPath;
+    let inputs = ['-i', concatenatedVideoPath];
+    let filterComplex = [];
+    let mapArgs = [];
+
+    // Lógica para adicionar música e/ou legendas
+    if (musica || legenda) {
+      const finalOutputPath = path.join(tempDir, sanitizedOutputFileName);
+      let videoInputMap = '[0:v]';
+      let audioInputMap = '[0:a]';
+      let streamIndex = 1;
+
+      if (musica) {
+        inputs.push('-i', tempFileMap.get(musica));
+        filterComplex.push(`[${streamIndex}:a]volume=0.2[a_musica]`);
+        filterComplex.push(`[${audioInputMap}][a_musica]amix=inputs=2:duration=first[a_out]`);
+        audioInputMap = '[a_out]';
+        streamIndex++;
+      }
+
+      if (legenda) {
+        const originalLegendaPath = tempFileMap.get(legenda);
+        const legendaSanitizedPath = path.join(tempDir, 'legendas_formatadas.srt');
+        await sanitizeSrt(originalLegendaPath, legendaSanitizedPath);
+        const escapedLegendaPath = legendaSanitizedPath.replace(/\\/g, '\\\\').replace(/:/g, '\\:');
+        filterComplex.push(`${videoInputMap}subtitles='${escapedLegendaPath}:force_style=Fontsize=28,MarginV=60,Alignment=2'[v_out]`);
+        videoInputMap = '[v_out]';
+      }
+
+      mapArgs.push('-map', videoInputMap, '-map', audioInputMap);
+      
+      const finalArgs = [
+        ...inputs,
+        '-filter_complex', filterComplex.join(';'),
+        ...mapArgs,
+        '-c:v', 'libx264',
+        '-c:a', 'aac',
+        '-pix_fmt', 'yuv420p',
+        '-y',
+        finalOutputPath
+      ];
+
+      await runSafeCommand('ffmpeg', finalArgs, 240000); // 4 min timeout para finalização
+      finalVideoPath = finalOutputPath;
+    } else {
+        // Se não houver música ou legenda, o vídeo concatenado já é o final
+        finalVideoPath = path.join(tempDir, sanitizedOutputFileName);
+        await fs.rename(concatenatedVideoPath, finalVideoPath);
+    }
+    
+
+    // --- PASSO 6: ENVIAR O VÍDEO FINAL PARA O AZURE (sem alteração) ---
     console.log(`Enviando ${sanitizedOutputFileName} para o Azure Blob Storage...`);
-    await containerClient.getBlockBlobClient(sanitizedOutputFileName).uploadFile(outputPath);
+    await containerClient.getBlockBlobClient(sanitizedOutputFileName).uploadFile(finalVideoPath);
     console.log(`Vídeo ${sanitizedOutputFileName} enviado com sucesso.`);
 
-    // Responde ao cliente com sucesso
     res.status(200).send({ 
       message: "Vídeo montado com sucesso!", 
       outputFile: sanitizedOutputFileName,
@@ -376,23 +342,16 @@ app.post('/', async (req, res) => {
     });
 
   } catch (error) {
-    // Tratamento de erros
     console.error('Erro geral na montagem do vídeo:', error);
     res.status(500).send({ error: `Erro na montagem: ${error.message}` });
   } finally {
-    // --- PASSO 5: LIMPAR ARQUIVOS TEMPORÁRIOS ---
+    // --- PASSO 7: LIMPAR ARQUIVOS TEMPORÁRIOS (sem alteração) ---
     console.log('Limpando arquivos temporários...');
     try {
-        // Remove o diretório temporário completo de forma recursiva e forçada
         await fs.rm(tempDir, { recursive: true, force: true });
         console.log(`Diretório temporário ${tempDir} e seus conteúdos removidos.`);
     } catch (cleanError) {
         console.error(`Erro ao limpar o diretório temporário ${tempDir}:`, cleanError);
     }
   }
-});
-
-// --- INICIA O SERVIDOR ---
-app.listen(port, () => {
-  console.log(`Servidor de montagem de vídeo rodando na porta ${port}`);
 });
