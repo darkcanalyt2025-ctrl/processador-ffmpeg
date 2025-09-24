@@ -103,10 +103,8 @@ async function processVideoInBackground(jobId, payload) {
   const { cenas, musica, legenda, outputFile } = payload;
   const blobServiceClient = BlobServiceClient.fromConnectionString(AZURE_STORAGE_CONNECTION_STRING);
   const containerClient = blobServiceClient.getContainerClient('videos');
-  const tempDir = path.join('/tmp', jobId); // Usar jobId para isolar arquivos temporários
+  const tempDir = path.join('/tmp', jobId);
   await fs.mkdir(tempDir, { recursive: true });
-
-  // O nome do arquivo de status será baseado no nome do arquivo de saída
   const statusFile = `${outputFile}.json`;
 
   try {
@@ -167,7 +165,10 @@ async function processVideoInBackground(jobId, payload) {
             const sanitizedSrtPath = path.join(tempDir, 'subtitles.srt');
             await sanitizeSrt(tempFileMap.get(legenda), sanitizedSrtPath);
             const escapedSrtPath = sanitizedSrtPath.replace(/\\/g, '\\\\').replace(/:/g, '\\:');
-            filterComplex.push(`${videoMap}subtitles='${escapedSrtPath}:force_style=Fontsize=28,MarginV=60,Alignment=2'[v_out]`);
+            
+            // --- ALTERAÇÃO APLICADA PARA LEGENDAS PROPORCIONAIS ---
+            const subtitleStyle = `'Fontsize=(h/40):MarginV=(h/20):Alignment=2'`;
+            filterComplex.push(`${videoMap}subtitles='${escapedSrtPath}:force_style=${subtitleStyle}'[v_out]`);
             videoMap = '[v_out]';
         }
         await runSafeCommand('ffmpeg', [...inputs, '-filter_complex', filterComplex.join(';'), '-map', videoMap, '-map', audioMap, '-c:v', 'libx264', '-c:a', 'aac', '-pix_fmt', 'yuv420p', '-y', finalOutputPath], 300000);
@@ -203,18 +204,15 @@ app.post('/', (req, res) => {
     return res.status(400).send({ error: 'Payload inválido. "cenas" e "outputFile" são obrigatórios.' });
   }
   
-  // Usaremos o nome do arquivo de saída (que deve ser único) como nosso Job ID
   const jobId = outputFile; 
   console.log(`Novo trabalho recebido. Job ID: ${jobId}`);
 
-  // Dispara o processo em segundo plano SEM esperar (fire-and-forget)
   processVideoInBackground(jobId, req.body);
 
-  // Responde imediatamente ao n8n, informando que o trabalho foi aceito
   res.status(202).send({ 
     message: "Processo de vídeo aceito e iniciado em segundo plano.",
     jobId: jobId,
-    statusFile: `${jobId}.json` // Informa ao n8n qual arquivo monitorar
+    statusFile: `${jobId}.json`
   });
 });
 
