@@ -12,8 +12,7 @@ app.use(express.json({ limit: '10mb' }));
 const port = process.env.PORT || 80;
 const AZURE_STORAGE_CONNECTION_STRING = process.env.AZURE_STORAGE_CONNECTION_STRING;
 
-// --- FUNÇÕES AUXILIARES (sem alterações) ---
-
+// --- FUNÇÕES AUXILIARES ---
 const runSafeCommand = (command, args, timeoutMs = 120000) => {
   return new Promise((resolve, reject) => {
     console.log(`Executando: ${command} ${args.join(' ')}`);
@@ -97,8 +96,7 @@ async function sanitizeSrt(inputPath, outputPath) {
   await fs.writeFile(outputPath, sanitizedBlocks.join("\n\n"), "utf8");
 }
 
-
-// --- NOVA FUNÇÃO PARA PROCESSAMENTO EM SEGUNDO PLANO ---
+// --- FUNÇÃO DE PROCESSAMENTO EM SEGUNDO PLANO ---
 async function processVideoInBackground(jobId, payload) {
   const { cenas, musica, legenda, outputFile } = payload;
   const blobServiceClient = BlobServiceClient.fromConnectionString(AZURE_STORAGE_CONNECTION_STRING);
@@ -109,7 +107,7 @@ async function processVideoInBackground(jobId, payload) {
 
   try {
     const tempFileMap = new Map();
-    // --- PASSO 1: BAIXAR TODOS OS ARQUIVOS ---
+    // PASSO 1: BAIXAR
     console.log(`[${jobId}] Baixando arquivos...`);
     const filesToProcess = [];
     cenas.forEach(c => {
@@ -125,28 +123,32 @@ async function processVideoInBackground(jobId, payload) {
       await containerClient.getBlockBlobClient(fileInfo.originalName).downloadToFile(localPath);
     }));
 
-    // --- PASSO 2: ANALISAR DURAÇÕES E FORMATO ---
+    // PASSO 2: ANALISAR
     console.log(`[${jobId}] Analisando arquivos...`);
     const sceneDurations = await Promise.all(cenas.map(c => runSafeCommand('ffprobe', ['-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', tempFileMap.get(c.narracao)]).then(parseFloat)));
     const dimensions = await getImageDimensions(tempFileMap.get(cenas[0].imagem));
     const videoFormat = determineVideoFormat(dimensions.width, dimensions.height);
 
-    // --- PASSO 3: CRIAR CLIPES INDIVIDUAIS ---
+    // PASSO 3: CRIAR CLIPES
     console.log(`[${jobId}] Etapa 1/3: Criando clipes individuais...`);
     const clipPaths = await Promise.all(cenas.map(async (cena, index) => {
       const clipOutputPath = path.join(tempDir, `clip_${index}.mp4`);
-      await runSafeCommand('ffmpeg', ['-loop', '1', '-i', tempFileMap.get(cena.imagem), '-i', tempFileMap.get(cena.narracao), '-t', sceneDurations[index].toString(), '-vf', `scale=${videoFormat.width}:${videoFormat.height}:force_original_aspect_ratio=decrease,pad=${videoFormat.width}:${videoFormat.height}:(ow-iw)/2:(oh-ih)/2,setsar=1`, '-c:v', 'libx264', '-c:a', 'aac', '-pix_fmt', 'yuv420p', '-shortest', '-y', clipOutputPath], 180000);
+      const ffmpegArgs = ['-loop', '1', '-i', tempFileMap.get(cena.imagem), '-i', tempFileMap.get(cena.narracao), '-t', sceneDurations[index].toString(), '-vf', `scale=${videoFormat.width}:${videoFormat.height}:force_original_aspect_ratio=decrease,pad=${videoFormat.width}:${videoFormat.height}:(ow-iw)/2:(oh-ih)/2,setsar=1`, '-c:v', 'libx264', '-c:a', 'aac', '-pix_fmt', 'yuv420p', '-shortest', '-y', clipOutputPath];
+      
+      // --- ALTERAÇÃO APLICADA AQUI ---
+      await runSafeCommand('ffmpeg', ffmpegArgs, 600000); // 10 min timeout por clipe
+      
       return clipOutputPath;
     }));
 
-    // --- PASSO 4: CONCATENAR CLIPES ---
+    // PASSO 4: CONCATENAR
     console.log(`[${jobId}] Etapa 2/3: Concatenando clipes...`);
     const concatListPath = path.join(tempDir, 'concat_list.txt');
     await fs.writeFile(concatListPath, clipPaths.map(p => `file '${p}'`).join('\n'));
     const concatenatedVideoPath = path.join(tempDir, 'concatenated.mp4');
     await runSafeCommand('ffmpeg', ['-f', 'concat', '-safe', '0', '-i', concatListPath, '-c', 'copy', '-y', concatenatedVideoPath], 60000);
 
-    // --- PASSO 5: ADICIONAR MÚSICA E LEGENDAS ---
+    // PASSO 5: ADICIONAR EXTRAS
     console.log(`[${jobId}] Etapa 3/3: Adicionando extras...`);
     let finalVideoPath = concatenatedVideoPath;
     if (musica || legenda) {
@@ -165,8 +167,6 @@ async function processVideoInBackground(jobId, payload) {
             const sanitizedSrtPath = path.join(tempDir, 'subtitles.srt');
             await sanitizeSrt(tempFileMap.get(legenda), sanitizedSrtPath);
             const escapedSrtPath = sanitizedSrtPath.replace(/\\/g, '\\\\').replace(/:/g, '\\:');
-            
-            // --- ALTERAÇÃO APLICADA PARA LEGENDAS PROPORCIONAIS ---
             const subtitleStyle = `'Fontsize=(h/40):MarginV=(h/20):Alignment=2'`;
             filterComplex.push(`${videoMap}subtitles='${escapedSrtPath}:force_style=${subtitleStyle}'[v_out]`);
             videoMap = '[v_out]';
@@ -178,11 +178,9 @@ async function processVideoInBackground(jobId, payload) {
         await fs.rename(concatenatedVideoPath, finalVideoPath);
     }
 
-    // --- PASSO 6: UPLOAD FINAL E STATUS DE SUCESSO ---
+    // PASSO 6: UPLOAD E STATUS
     console.log(`[${jobId}] Enviando vídeo final para o Azure...`);
     await containerClient.getBlockBlobClient(outputFile).uploadFile(finalVideoPath);
-
-    console.log(`[${jobId}] Processo concluído com sucesso. Criando arquivo de status.`);
     const successStatus = { status: 'completed', outputFile: outputFile, completedAt: new Date().toISOString() };
     await containerClient.getBlockBlobClient(statusFile).upload(JSON.stringify(successStatus), Buffer.byteLength(JSON.stringify(successStatus)));
 
@@ -196,19 +194,15 @@ async function processVideoInBackground(jobId, payload) {
   }
 }
 
-// --- ROTA PRINCIPAL DA API (MODIFICADA PARA SER ASSÍNCRONA) ---
+// --- ROTA PRINCIPAL ---
 app.post('/', (req, res) => {
   const { outputFile } = req.body;
-
   if (!req.body.cenas || !outputFile) {
-    return res.status(400).send({ error: 'Payload inválido. "cenas" e "outputFile" são obrigatórios.' });
+    return res.status(400).send({ error: 'Payload inválido.' });
   }
-  
   const jobId = outputFile; 
   console.log(`Novo trabalho recebido. Job ID: ${jobId}`);
-
   processVideoInBackground(jobId, req.body);
-
   res.status(202).send({ 
     message: "Processo de vídeo aceito e iniciado em segundo plano.",
     jobId: jobId,
